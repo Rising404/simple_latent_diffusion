@@ -1,4 +1,4 @@
-# Diffusion Model Repo
+# Latent Diffusion Model 
 
 这是一个精简后的扩散模型项目，包含训练与采样推理所需核心代码。
 
@@ -6,7 +6,7 @@
 
 - `train.py`：训练入口
 - `sampler.py`：推理/采样入口（支持 prompt 和图生图参数）
-- `models/`：模型定义（UNet + VAE）
+- `models/`：模型定义（Attention-based UNet + VAE）
 - `datasets/`：数据集读取
 - `utils/`：文本编码等工具
 
