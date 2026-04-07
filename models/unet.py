@@ -1,26 +1,42 @@
-"""
-Standalone UNet for latent diffusion.
-输入输出通道默认 4（Stable Diffusion 风格 latent）。
-保留注释便于学习。
-"""
 import torch  # 张量与自动求导
 import torch.nn as nn  # 模块与层
 
 
 # --- Time embedding utilities ---
+# timesteps为输入时间步序列
+# dim表示经过编码后，每个时间步输出多少维度的信息
+# max_period控制频率范围，仅服务于embedding编码方式，与timesteps，dim无关
 def timestep_embedding(timesteps, dim, max_period=10000):
-    device = timesteps.device  # 时间步张量所在设备
-    half = dim // 2  # sin/cos 各占一半
+    device = timesteps.device  
+
+    # sin/cos 各占一半，若dim为奇数后补充
+    half = dim // 2  
+
+    # 编码每个时间步在预计的输出维度上的频率关系
+    # 方法同transformer经典论文位置编码
+    # 得到freqs[]，长half
     freqs = torch.exp(
         -torch.log(torch.tensor(max_period, device=device))
         * torch.arange(0, half, device=device).float()
         / half
-    )  # 几何级频率
-    args = timesteps.float()[:, None] * freqs[None]  # 形状 [B, half]
-    emb = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)  # 拼出 [B, dim 或 dim-1]
+    )  
+
+    # timesteps为[B]，[:, None]扩展成[B, 1]
+    # freqs[None]扩展为[1, half]
+    # 广播相乘得到[B, half]
+    args = timesteps.float()[:, None] * freqs[None] 
+
+    # 拼出 [B, dim 或 dim-1]
+    emb = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)  
+
+    # dim为奇数则在[B, dim-1]末尾补一行全0[B, 1]，得到[B, dim]
+    # 补0是位置编码方法规定的，主要用于保证输出维度匹配
     if dim % 2:
-        emb = torch.cat([emb, torch.zeros_like(emb[:, :1])], dim=-1)  # 奇数维补零
-    return emb  # [B, dim]
+        emb = torch.cat([emb, torch.zeros_like(emb[:, :1])], dim=-1) 
+
+    # [B, dim]
+    return emb  
+
 
 
 class TimeEmbedding(nn.Module):
@@ -33,13 +49,12 @@ class TimeEmbedding(nn.Module):
         )
 
     def forward(self, t):
-        emb = timestep_embedding(t, self.mlp[0].in_features)  # 正弦位置编码
-        return self.mlp(emb)  # 经过 MLP 的时间嵌入
+        emb = timestep_embedding(t, self.mlp[0].in_features)  
+        return self.mlp(emb)  
+
 
 
 class IndustrialUpConv(nn.Module):
-    """Nearest + 3x3 conv，避免棋盘格伪影。"""
-
     def __init__(self, in_channels, out_channels):
         super().__init__()
         self.upsample = nn.Upsample(scale_factor=2, mode="nearest")  # 最近邻上采样
@@ -111,14 +126,24 @@ class CrossAttention(nn.Module):
         assert query_dim % num_heads == 0
         self.num_heads = num_heads
         self.head_dim = query_dim // num_heads
+        # self时使用的conv2d，此处使用的linear，更多的取决去输入格式
+        # self输入为[N, C, H, W]，cross输入为[N, seq_len, context_dim]
+        # 前者C在HW两维上，后者在seq_len上，决定了前者适合conv2d，后者适合linear
+        # nn.Linear封装自动把输入张量的最后一维作为要处理的in_features
         self.to_q = nn.Linear(query_dim, query_dim)
         self.to_k = nn.Linear(context_dim, query_dim)
         self.to_v = nn.Linear(context_dim, query_dim)
         self.proj_out = nn.Linear(query_dim, query_dim)
 
     def forward(self, x, context):
+        # 输入图像x格式变化，本质N, H*W, C
         N, L, C = x.shape
         q = self.to_q(x).view(N, L, self.num_heads, self.head_dim).permute(0, 2, 1, 3)  # [B, heads, HW, dim]
+
+        # context输入格式N, seq_len, context_dim，seq_len其实就是文本长、token数
+        # attn其实是在求 [H*W, seq_len] 的注意力分数
+        # 此处-1其实就是seq_len，-1为pytorch语法自动推断维度，可灵活适配
+        # pytorch自动推理基于当前张量实际形状，总元素已知、其它维已知，可求
         k = self.to_k(context).view(N, -1, self.num_heads, self.head_dim).permute(0, 2, 3, 1)  # [B, heads, dim, seq]
         v = self.to_v(context).view(N, -1, self.num_heads, self.head_dim).permute(0, 2, 1, 3)  # [B, heads, seq, dim]
         attn = torch.matmul(q, k) * (self.head_dim ** -0.5)
@@ -129,18 +154,20 @@ class CrossAttention(nn.Module):
 
 
 class AttentionBlock(nn.Module):
-    """
-    2D self-attn + cross-attn（文本可选），保持卷积特征形状。
-    """
-
     def __init__(self, query_dim, context_dim, num_heads=8):
         super().__init__()
         self.norm_in = nn.GroupNorm(32, query_dim)
+        # 图像多头自注意力，获取图片不同位置之间的关系
         self.attn1 = SelfAttention(query_dim, num_heads=num_heads)
+        # 图像流中以图像质询文字，获取图文关系，依旧输出图像信息
         self.attn2 = CrossAttention(query_dim=query_dim, context_dim=context_dim, num_heads=num_heads)
+        # 注意力机制只能获取位置与位置、位置与文字之间的联系
+        # 和transformer经典架构一样，引入前馈网络进一步增强特征表达能力
         hidden_dim = query_dim * 4
+        # ffn升维度、激活、降维
         self.ffn = nn.Sequential(
             nn.Linear(query_dim, hidden_dim),
+            # 这里使用GELU激活，原论文使用SiLU，两者性能相近，GELU在transformer中更常见
             nn.GELU(),
             nn.Linear(hidden_dim, query_dim),
         )
@@ -148,13 +175,18 @@ class AttentionBlock(nn.Module):
     def forward(self, x, context=None):
         B, C, H, W = x.shape
         h = self.norm_in(x)
-        h = self.attn1(h)  # 自注意力
+        # 此处写的不是很统一，可能稍稍有点混乱
+        # attn1调用的SelfAttention中已经封装了残差，故此处直接调用
+        h = self.attn1(h)  
         h_seq = h.view(B, C, H * W).permute(0, 2, 1)  # 展平 [B, HW, C]
         if context is not None:
+            # attn2调用的CrossAttention中没有封装残差，故此处手动加上
             h_seq = h_seq + self.attn2(h_seq, context)  # 交叉注意力
-        h_seq = h_seq + self.ffn(h_seq)  # 前馈
+        # 同理，本块中的ffn也没有封装残差，手动加上
+        h_seq = h_seq + self.ffn(h_seq)
         h = h_seq.permute(0, 2, 1).contiguous().view(B, C, H, W)  # 还原
-        return x + h  # 残差
+        # attention学习的也是残差
+        return x + h 
 
 
 class DownBlock(nn.Module):
@@ -199,6 +231,7 @@ class UpBlock(nn.Module):
         self.resnets = nn.ModuleList()     # 堆叠层
         self.attentions = nn.ModuleList()  # 对应注意力
         for i in range(num_layers):
+            # 上采样过程中输入为当前层输入与 skip 连接的拼接
             res_in_c = (in_channels + skip_channels) if i == 0 else out_channels
             self.resnets.append(
                 ResnetBlock(in_channels=res_in_c, out_channels=out_channels, time_emb_dim=time_emb_dim)
