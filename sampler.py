@@ -9,7 +9,7 @@ from models import AutoencoderKL, ModernDiffusionUNet
 
 
 def _lazy_clip():
-    """按需导入 open_clip，未安装时允许纯无文本推理。"""
+    # 按需导入 open_clip，未安装时允许纯无文本推理。
     try:
         from utils.text_encoder import load_clip, encode_text
         return load_clip, encode_text
@@ -17,18 +17,21 @@ def _lazy_clip():
         return None, None
 
 
-def make_beta_schedule(num_steps=1000, beta_start=1e-4, beta_end=0.02):
-    """与训练一致的线性 beta 调度，用于重建 α 表。"""
-    return torch.linspace(beta_start, beta_end, num_steps)
+def make_beta_schedule(init_schedule_steps=1000, beta_start=1e-4, beta_end=0.02):
+    # 与训练一致的线性 beta 调度，用于重建 α 表。
+    return torch.linspace(beta_start, beta_end, init_schedule_steps)
 
 
 class DDIMSampler:
-    """DDIM 采样器：在 latent 空间迭代去噪，再用 VAE 解码。"""
+    # DDIM 采样器：在 latent 空间迭代去噪，再用 VAE 解码。
 
+    # DDIM默认跳步加速，此处num_steps取50
     def __init__(self, model, num_steps=50, eta=0.0, device="cpu"):
-        self.model = model  # UNet
-        self.num_steps = num_steps  # 采样步数
-        self.eta = eta  # 随机性系数（0 表示确定性）
+        self.model = model  
+        self.num_steps = num_steps  
+        # 随机性系数（0 表示确定性）
+        # sample()迭代预测x_prev时是否引入额外噪声的控制器
+        self.eta = eta  
         self.device = device
 
         # 构造 1000 步基础表，再子采样到 num_steps
@@ -58,29 +61,37 @@ class DDIMSampler:
 
         # 逆序时间步（t 从大到小）
         for i, t in enumerate(reversed(self.ddim_timesteps)):
-            t_tensor = torch.tensor([t] * x.size(0), device=self.device)  # 当前时间步
+            # 每轮其实只传某一个时间步，但shape依旧要从[1]广播对齐成网络输入t_tensor[B]
+            t_tensor = torch.tensor([t] * x.size(0), device=self.device)
             alpha = self.alphas_cumprod[t]
             sqrt_alpha = self.sqrt_alpha[t]
             sqrt_one_minus = self.sqrt_one_minus[t]
 
             # 预测噪声 eps
             eps = self.model(x, t_tensor, context)
+            # 是否引入条件控制
+            # uncond/base，为偏离的基线
+            # cond/target，为目标条件
+            # guidance_scale 和 context 共同限制eps是否考虑文本控制
             if guidance_scale != 1.0 and context is not None:
                 eps_cond = eps
                 eps_uncond = self.model(x, t_tensor, context=None)
                 eps = eps_uncond + guidance_scale * (eps_cond - eps_uncond)  # CFG
 
-            # 反推 x0
+            # 当前条件反推 x0
             pred_x0 = (x - sqrt_one_minus * eps) / sqrt_alpha
 
+            # 准备迭代，sample本质是从头/某一时间步反推上一时间步
             # 计算上一时刻 x_{t-1}
             if i == self.num_steps - 1:  # 最后一步
                 x_prev = pred_x0 * sqrt_alpha + sqrt_one_minus * eps
             else:
-                t_prev = self.ddim_timesteps[len(self.ddim_timesteps) - i - 2]
+                # 提取下一时间步
+                t_prev = self.ddim_timesteps[len(self.ddim_timesteps) - 1 -(i+1)]
                 alpha_prev = self.alphas_cumprod[t_prev]
                 sigma = self.eta * math.sqrt((1 - alpha_prev) / (1 - alpha) * (1 - alpha / alpha_prev))
                 noise = torch.randn_like(x) if sigma > 0 else 0.0
+                # 根据当前eps损失和pred_x0推测下一步的输入x_prev
                 x_prev = (
                     torch.sqrt(alpha_prev) * pred_x0
                     + torch.sqrt(1 - alpha_prev - sigma**2) * eps
@@ -88,12 +99,12 @@ class DDIMSampler:
                 )
             x = x_prev
 
-        imgs = vae.decode(x)  # latent -> 像素
+        imgs = vae.decode(x) 
         return imgs
 
 
 def load_models(ckpt_path, device):
-    """载入 ckpt，返回 VAE 与 UNet。"""
+    # 载入 ckpt，返回 VAE 与 UNet。
     ckpt = torch.load(ckpt_path, map_location=device)
     vae = AutoencoderKL().to(device)
     unet = ModernDiffusionUNet().to(device)
