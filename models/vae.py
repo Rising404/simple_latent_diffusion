@@ -137,7 +137,7 @@ class Decoder(nn.Module):
         h = self.block3(h)
         # 输出前处理
         h = self.act_out(self.norm_out(h))
-        return torch.tanh(self.conv_out(h))  # 限制到 [-1,1]
+        return torch.tanh(self.conv_out(h))  # 限制到 [-1,1]，所以使用vae的输出时还需要额外缩放
 
 
 class AutoencoderKL(nn.Module):
