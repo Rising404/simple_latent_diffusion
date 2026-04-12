@@ -19,6 +19,9 @@ runs/
 *.ckpt
 samples.png
 
+# Personal scratch file
+practice.py
+
 # OS files
 .DS_Store
 Thumbs.db

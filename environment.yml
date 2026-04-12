@@ -1,0 +1,12 @@
+name: diffusion_model
+channels:
+  - pytorch
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - pytorch
+  - torchvision
+  - pillow
+  - pip:
+      - open_clip_torch

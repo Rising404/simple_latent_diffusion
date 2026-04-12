@@ -12,7 +12,28 @@
 
 ## 环境建议
 
-建议使用 conda/venv 环境，并安装项目所需依赖（如 `torch`、`torchvision`、`Pillow`、文本编码相关包）。
+建议使用 conda/venv 环境，并安装项目所需依赖。
+
+### 一键安装
+
+```bash
+pip install -r requirements.txt
+```
+
+如果你用的是 conda，推荐直接使用仓库内的 `environment.yml`：
+
+```bash
+conda env create -f environment.yml
+conda activate diffusion_model
+```
+
+若你更习惯手动安装，也可以继续使用：
+
+```bash
+conda create -n diffusion_model python=3.10 -y
+conda activate diffusion_model
+pip install -r requirements.txt
+```
 
 ## 训练示例
 
@@ -32,7 +53,6 @@ python train.py --jsonl /path/to/train.jsonl --img_root /path/to/images --resolu
 python sampler.py --ckpt runs/ckpt_final.pt --n 4 --steps 50 --eta 0.0 --guidance 1.0 --out samples.png
 ```
 
-让我梳理一下我们如何构建的网络框架：
 
 【宏观网络架构】：
 
