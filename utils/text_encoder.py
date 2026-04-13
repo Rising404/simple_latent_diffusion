@@ -1,7 +1,7 @@
-"""
-CLIP 文本编码封装，便于训练/推理共用。
-依赖 open_clip_torch：pip install open_clip_torch
-"""
+
+# CLIP 文本编码封装，便于训练/推理共用。
+# 依赖 open_clip_torch：pip install open_clip_torch
+
 import torch
 import open_clip
 
