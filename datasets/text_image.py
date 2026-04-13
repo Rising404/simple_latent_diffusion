@@ -7,10 +7,8 @@ from torch.utils.data import Dataset
 
 
 class TextImageJsonl(Dataset):
-    """
-    简单的 jsonl 数据集，每行包含:
-    {"image": "relative/or/absolute/path.jpg", "caption": "text ..."}
-    """
+    # 简单的 jsonl 数据集，每行包含:
+    # {"image": "relative/or/absolute/path.jpg", "caption": "text ..."}
 
     def __init__(self, jsonl_path, img_root=None, transform=None):
         self.items = []
@@ -36,3 +34,5 @@ class TextImageJsonl(Dataset):
             img = self.transform(img)
         caption = rec.get("caption", "")
         return {"pixel_values": img, "caption": caption}
+
+

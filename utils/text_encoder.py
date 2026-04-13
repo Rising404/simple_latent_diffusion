@@ -5,7 +5,7 @@ CLIP 文本编码封装，便于训练/推理共用。
 import torch
 import open_clip
 
-
+# 加载目标模型、文本编辑器
 def load_clip(model_name="ViT-B-32", pretrained="laion2b_s34b_b79k", device="cpu"):
     model, _, _ = open_clip.create_model_and_transforms(model_name, pretrained=pretrained, device=device)
     tokenizer = open_clip.get_tokenizer(model_name)
@@ -17,6 +17,7 @@ def load_clip(model_name="ViT-B-32", pretrained="laion2b_s34b_b79k", device="cpu
 
 
 @torch.no_grad()
+# 使用加载的模型进行处理
 def encode_text(model, tokenizer, prompts, device="cpu"):
     """
     prompts: list[str]

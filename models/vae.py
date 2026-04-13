@@ -144,7 +144,6 @@ class AutoencoderKL(nn.Module):
     # VAE 整体封装，除了完成vae自身压缩任务，也提供单独工具，查看某步结果
     # __init__用于指定vae的输入、中间特征维度、目标latent_ch、特定缩放因子
 
-
     def __init__(self, in_ch=3, base_ch=128, latent_ch=4, scaling_factor=0.18215):
         super().__init__()
         self.encoder = Encoder(in_ch, base_ch, latent_ch)
