@@ -103,7 +103,7 @@ class DDIMSampler:
         return imgs
 
 
-def load_models(ckpt_path, device):
+def load_models(ckpt_path, device, vae_override=None):
     # 载入 ckpt，返回 VAE 与 UNet。
     # weights_only=True用于提防恶意代码
     # torch.load()返回的是字典
@@ -111,8 +111,13 @@ def load_models(ckpt_path, device):
     # 实例化两个空的模型对象
     vae = AutoencoderKL().to(device)
     unet = ModernDiffusionUNet().to(device)
-    # 把参数从字典中提取出来加载到空模型上
-    vae.load_state_dict(ckpt["vae"])
+    # 把参数从字典中提取出来加载到空模型上；若显式指定外部 VAE，则使用外部权重
+    if vae_override:
+        vae_ckpt = torch.load(vae_override, map_location=device)
+        load_info = vae.load_state_dict(vae_ckpt, strict=False)
+        print(f"[vae] override loaded from {vae_override}, missing={load_info.missing_keys}, unexpected={load_info.unexpected_keys}")
+    else:
+        vae.load_state_dict(ckpt["vae"])
     unet.load_state_dict(ckpt["unet"])
     # 只用不练
     vae.eval()
@@ -140,11 +145,12 @@ def main():
     parser.add_argument("--beta_start", type=float, default=1e-4, help="Beta 调度起点")
     parser.add_argument("--beta_end", type=float, default=0.02, help="Beta 调度终点")
     parser.add_argument("--num_schedule_timesteps", type=int, default=1000, help="Beta 调度总步数")
+    parser.add_argument("--vae_ckpt", type=str, default=None, help="外部 VAE state_dict 路径（推理阶段覆盖 ckpt 内置 VAE）")
     # 实例化对象为args，后续可通过args.ckpt等来访问
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    vae, unet = load_models(args.ckpt, device)
+    vae, unet = load_models(args.ckpt, device, vae_override=args.vae_ckpt)
 
     # 文本条件（可选）文生图需要prompt
     context = None

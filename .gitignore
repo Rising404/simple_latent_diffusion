@@ -1,23 +1,32 @@
-# Python cache
+# Python cache (keep ignored; generated automatically)
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
 *.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
 # Virtual environments
 .venv/
 venv/
 env/
 
+# Editor config
+.vscode/
+
 # Jupyter
 .ipynb_checkpoints/
 
-# Training outputs
+# Datasets / large local assets
+data/
+
+# Training and inference outputs
 runs/
+samples/
+samples.png
 *.pt
 *.pth
 *.ckpt
-samples.png
 
 # Personal scratch file
 practice.py
