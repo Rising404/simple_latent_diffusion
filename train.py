@@ -10,93 +10,94 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms, utils
 
-from models import AutoencoderKL, ModernDiffusionUNet
+from models import ModernDiffusionUNet
 from utils.text_image import TextImageJsonl
 from utils.text_encoder import load_clip, encode_text
+from utils.vae_adapter import create_vae, extract_vae_state_dict
 
 
 def make_beta_schedule(num_steps=1000, beta_start=1e-4, beta_end=0.02):
-    # 绾挎€?beta 璋冨害锛岃缁冧笌閲囨牱淇濇寔涓€鑷?
+    # 线性 beta 调度，训练与采样保持一致
     return torch.linspace(beta_start, beta_end, num_steps)
 
 
 class DiffusionSchedule:
     def __init__(self, num_steps=1000, beta_start=1e-4, beta_end=0.02, device="cpu"):
-        # 鍒濆鍖栧姞鍣弬鏁?
+        # 初始化加噪参数
         self.betas = make_beta_schedule(num_steps, beta_start, beta_end).to(device)
         self.alphas = 1.0 - self.betas
         self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)
-        # 鏋勫缓鍓嶄竴鏃跺埢鐨刟lphas_cumprod搴忓垪
-        # 1.0 + [:-1]锛屽幓鎺夊師搴忓垪鏈€鍚庝竴浣?
+        # 构建前一时刻的alphas_cumprod序列
+        # 1.0 + [:-1]，去掉原序列最后一位
         self.alphas_cumprod_prev = torch.cat([
             torch.tensor([1.0], device=device), self.alphas_cumprod[:-1]
         ], dim=0)
 
     def sample_timesteps(self, batch_size):
-        # (batch_size,) 涓?batch 涓瘡涓牱鏈潎鍖€闅忔満鎶藉彇涓€涓?-锛坙en-1锛夌殑鏃堕棿姝?t锛屾渶缁堣繑鍥瀃B]
-        # torch.randint()鍙朳)锛屾棤闇€-1
+        # (batch_size,) 为 batch 中每个样本均匀随机抽取一个0-（len-1）的时间步 t，最终返回[B]
+        # torch.randint()取[)，无需-1
         return torch.randint(0, len(self.betas), (batch_size,), device=self.betas.device)
 
-# 鏃犳枃鏈?鍥剧墖璁粌鐨勬暟鎹姞杞藉櫒
+# 无文本+图片训练的数据加载器
 def build_dataloader(data_root, resolution, batch_size, num_workers, shuffle=True):
-    # 绠€鍗?ImageFolder 鏁版嵁鍔犺浇鍣ㄧ敤浜庢棤鏂囨湰璁粌
+    # 简单 ImageFolder 数据加载器用于无文本训练
     tfm = transforms.Compose([
-        # BILINEAR涓虹缉鏀惧浘鐗囨椂浣跨敤鍙岀嚎鎬ф彃鍊?
+         # BILINEAR为缩放图片时使用双线性插值
         transforms.Resize(resolution, interpolation=transforms.InterpolationMode.BILINEAR),
         transforms.CenterCrop(resolution),
         transforms.ToTensor(),
     ])
-    # .ImageFolder()閬嶅巻璺緞涓嬬殑鍥剧墖骞惰褰曡矾寰勶紝璇诲彇鏃剁粡杩噒rnasform澶勭悊
-    # 浣嗗繀椤绘敞鎰忥紝鍥剧墖骞朵笉鐩存帴鏀惧湪data_root涓嬭€屾槸鏀惧湪鍏跺瓙鏂囦欢澶逛腑
-    # ImageFolder鎵弿 data_root 涓嬬殑涓€绾у瓙鏂囦欢澶瑰悕浣滀负绫诲埆鍚嶏紝杩斿洖tuple(image, class_idx)
+    # .ImageFolder()遍历路径下的图片并记录路径，读取时经过trnasform处理
+    # 但必须注意，图片并不直接放在data_root下而是放在其子文件夹中
+    # ImageFolder扫描 data_root 下的一级子文件夹名作为类别名，返回tuple(image, class_idx)
     ds = datasets.ImageFolder(data_root, transform=tfm)
-    # num_workers鎸囧畾绾跨▼姹犳暟
-    # pin_memory=True鐢ㄤ簬灏嗘暟鎹攣瀹氬湪鍐呭瓨涓笉鎹㈤〉鑷崇‖鐩橈紝鐢ㄤ簬鎻愰€?
+    # num_workers指定线程池数
+    # pin_memory=True用于将数据锁定在内存中不换页至硬盘，用于提速
     return DataLoader(ds, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, pin_memory=True)
 
-# 鏂囨湰+鍥剧墖璁粌鐨勬暟鎹姞杞藉櫒
+# 文本+图片训练的数据加载器
 def build_jsonl_dataloader(jsonl_path, img_root, resolution, batch_size, num_workers, shuffle=True):
-    # jsonl 鏁版嵁闆嗗彲鍚屾椂鎻愪緵鍥惧儚涓庢枃鏈?caption锛岀敤浜庢潯浠惰缁?
+     # jsonl 数据集可同时提供图像与文本 caption，用于条件训练
     tfm = transforms.Compose([
         transforms.Resize(resolution, interpolation=transforms.InterpolationMode.BILINEAR),
         transforms.CenterCrop(resolution),
         transforms.ToTensor(),
     ])
-    # 鑷畾涔塂ataset绫诲瀷瀹炰緥
+    # 自定义Dataset类型实例
     ds = TextImageJsonl(jsonl_path, img_root=img_root, transform=tfm)
     return DataLoader(ds, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, pin_memory=True)
 
 
 def diffusion_loss(model, vae, schedule: DiffusionSchedule, x0, context=None):
-    # 涓€杞缁冪殑鎹熷け璁＄畻锛歎Net 棰勬祴鍣０锛孧SE 涓轰富鎹熷け锛岄檮鍔犲皬鏉冮噸鐨?posterior KL 姝ｅ垯
+    # 一轮训练的损失计算：UNet 预测噪声，MSE 为主损失，附加小权重的 posterior KL 正则
     device = x0.device
-    # 绔埌绔缁冩椂涓嶅喕缁?VAE锛屾柟渚胯仈鍚堜紭鍖?
-    # 缂栫爜寰?latent z 涓庡悗楠屽垎甯?
+    # 端到端训练时不冻结 VAE，方便联合优化
+    # 编码得 latent z 与后验分布
     z, posterior = vae.encode(x0)  
-    # 鍙朾atch_size
+    # 取batch_size
     bsz = z.size(0)
-    # t浠ｈ〃姣忎釜鏍锋湰瀵瑰簲鐨勬椂闂存[B]
+     # t代表每个样本对应的时间步[B]
     t = schedule.sample_timesteps(bsz)
     noise = torch.randn_like(z)  # 鐪熷疄鍣０
 
     # x_t = sqrt(alpha_bar) * z + sqrt(1-alpha_bar) * noise
-    # alphas_cumprod褰㈢姸涓篬B]锛岄渶鎵╁睍鑷砙B,1,1,1]
+    # alphas_cumprod形状为[B]，需扩展至[B,1,1,1]
     alpha_bar = schedule.alphas_cumprod[t].view(-1, 1, 1, 1)
-    # z鍔犲櫔鍚?
+    # z加噪后
     noisy_z = torch.sqrt(alpha_bar) * z + torch.sqrt(1 - alpha_bar) * noise
 
-    # UNet 棰勬祴鍣０锛宲red渚濇棫鏄痆B,4,32,32]
+    # UNet 预测噪声，pred依旧是[B,4,32,32]
     pred = model(noisy_z, t, context)  
     mse = F.mse_loss(pred, noise, reduction="mean")
 
-    # posterior KL 浣滀负杈呭姪姝ｅ垯椤癸紙鏉冮噸寰堝皬锛?
+    # posterior KL 作为辅助正则项（权重很小）
     kl = posterior.kl().mean()
     return mse + 1e-4 * kl, {"mse": mse.item(), "kl": kl.item()}
 
 
 @torch.no_grad()
 def evaluate(unet, vae, schedule, dataloader, device, max_batches=50, text_encoder=None, tokenizer=None, caption_drop=0.0):
-    # 鍦ㄩ獙璇侀泦涓婅绠楀钩鍧?loss/mse/kl锛屼笉鍥炰紶姊害銆?
+    # 在验证集上计算平均 loss/mse/kl，不回传梯度。
     unet.eval()
     vae.eval()
     total_loss = total_mse = total_kl = 0.0
@@ -134,50 +135,58 @@ def evaluate(unet, vae, schedule, dataloader, device, max_batches=50, text_encod
 def train(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # 浼樺厛鍔犺浇 jsonl锛堝甫 caption锛夛紝鍚﹀垯浣跨敤 ImageFolder
+    # 优先加载 jsonl（带 caption），否则使用 ImageFolder
     if args.jsonl is not None:
         dataloader = build_jsonl_dataloader(args.jsonl, args.img_root, args.resolution, args.batch_size, args.num_workers, shuffle=True)
     else:
         dataloader = build_dataloader(args.data_root, args.resolution, args.batch_size, args.num_workers, shuffle=True)
 
-    # 楠岃瘉闆嗭紙鍙€夛級
+    # 验证集（可选）
     val_loader = None
     if args.val_jsonl is not None:
         val_loader = build_jsonl_dataloader(args.val_jsonl, args.val_img_root, args.resolution, args.batch_size, args.num_workers, shuffle=False)
     elif args.val_root is not None:
         val_loader = build_dataloader(args.val_root, args.resolution, args.batch_size, args.num_workers, shuffle=False)
 
-    vae = AutoencoderKL().to(device)
+    vae = create_vae(
+        backend=args.vae_backend,
+        device=device,
+        source=args.vae_source if args.vae_backend == "diffusers" else None,
+    )
+    if args.vae_backend == "diffusers":
+        print(f"[vae] backend=diffusers source={args.vae_source}")
+    else:
+        print("[vae] backend=toy")
     if args.vae_ckpt:
         # 允许加载外部预训练 VAE，strict=False 以兼容部分键名不一致
-        ckpt = torch.load(args.vae_ckpt, map_location=device)
-        load_info = vae.load_state_dict(ckpt, strict=False)
+        vae_ckpt_obj = torch.load(args.vae_ckpt, map_location=device)
+        load_info = vae.load_state_dict(extract_vae_state_dict(vae_ckpt_obj), strict=False)
         print(f"[vae] loaded from {args.vae_ckpt}, missing={load_info.missing_keys}, unexpected={load_info.unexpected_keys}")
-        if args.freeze_vae:
-            for p in vae.parameters():
-                p.requires_grad = False
-            print("[vae] parameters frozen (只训练 UNet)")
+    if args.freeze_vae:
+        for p in vae.parameters():
+            p.requires_grad = False
+        print("[vae] parameters frozen (只训练 UNet)")
 
     unet = ModernDiffusionUNet().to(device)
 
-    # 鏂囨湰缂栫爜鍣紙鍙€夛級鐢ㄤ簬灏?caption 缂栫爜涓?context
+    # 文本编码器（可选）用于将 caption 编码为 context
     text_encoder = None
     tokenizer = None
     if args.jsonl is not None:
         text_encoder, tokenizer = load_clip(device=device)
 
-    # 瀹炰緥鍖栧姞鍣柟寮?
+    # 实例化加噪方式
     schedule = DiffusionSchedule(args.num_steps, args.beta_start, args.beta_end, device)
 
-    # 鍚屾椂璁粌unet鍜寁ae鐨勫弬鏁帮紱鑻ュ喕缁?VAE 鍒欏彧浼樺寲 UNet
+    # 同时训练unet和vae的参数；若冻结 VAE 则只优化 UNet
     if args.freeze_vae:
         params = list(unet.parameters())
     else:
         params = list(unet.parameters()) + list(vae.parameters())
     optimizer = optim.AdamW(params, lr=args.lr, betas=(0.9, 0.999), weight_decay=1e-4)
 
-    # 娣峰悎绮惧害浼樺寲锛実radient scaling
-    # 浼樺寲鎴恌loat16鑳藉噺灏戞樉瀛樺崰鐢ㄤ絾浼氬鑷寸簿搴︽崯澶憋紝闇€瑕乻cale閬垮厤鎹熷け锛岃瑙佺埗绫伙細
+    # 混合精度优化，gradient scaling
+    # 优化成float16能减少显存占用但会导致精度损失，需要scale避免损失，详见父类：
     # https://github.com/pytorch/pytorch/blob/v2.11.0/torch/amp/grad_scaler.py
     # AMP：仅在 CUDA 设备上启用，避免 CPU 环境报错
     scaler = torch.amp.GradScaler(
@@ -196,81 +205,82 @@ def train(args):
         best_log_path.write_text("step,loss,mse,kl,ckpt\n", encoding="utf-8")
 
     global_step = 0
-    # 鍒濆鍖栨渶澶х敤浜庨獙璇侀泦娴嬭瘯姣旇緝
+    # 初始化最大用于验证集测试比较
     best_val = float("inf")
     for epoch in range(args.epochs):
         for batch in dataloader:
-            # 鑻ュ寘鍚枃瀛楀垯batch涓哄瓧鍏哥被鍨?
+             # 若包含文字则batch为字典类型
             if args.jsonl is not None:
-                # 鑾峰彇鍥剧墖鍜屾枃瀛?
+                # 获取图片和文字
                 x = batch["pixel_values"].to(device)
                 captions = batch["caption"]
-                # classifier-free guidance 鐨勮缁冿細闅忔満涓㈠純閮ㄥ垎鏂囨湰锛屼娇妯″瀷瀛︿細鏃犳潯浠剁敓鎴?
+                # classifier-free guidance 的训练：随机丢弃部分文本，使模型学会无条件生成
                 if text_encoder is not None:
                     text_feat = encode_text(text_encoder, tokenizer, captions, device=device)
-                    # drop_mask寰楀埌[B]鐨刐0,1,0,1,...]甯冨皵搴忓垪
-                    # 瀵?batch 閲屾瘡涓牱鏈嫭绔嬮噰鏍蜂竴涓殢鏈烘暟锛岃嫢灏忎簬 caption_drop 灏辩疆涓?True
-                    #  True 琛ㄧず杩欎釜鏍锋湰瑕佷涪鏂囨湰鏉′欢
+                    # drop_mask得到[B]的[0,1,0,1,...]布尔序列
+                    # 对 batch 里每个样本独立采样一个随机数，若小于 caption_drop 就置为 True
+                    #  True 表示这个样本要丢文本条件
                     drop_mask = torch.rand(len(captions), device=device) < args.caption_drop
-                    # ~鍙栧弽锛屽皢鎺╃爜浣滅敤浜庢枃鏈壒寰佸疄鐜伴殢鏈轰涪寮冿紝骞舵墿灞曟垚[B,1]
-                    # encode_text()杈撳嚭[B, hidden_dim]锛屾澶?[B, hidden_dim] * [B, 1](broadcast)锛岄€愬厓绱犵浉涔?
+                    # ~取反，将掩码作用于文本特征实现随机丢弃，并扩展成[B,1]
+                    # encode_text()输出[B, hidden_dim]，此处 [B, hidden_dim] * [B, 1](broadcast)，逐元素相乘
                     text_feat = text_feat * ((~drop_mask).float().unsqueeze(1))
                 else:
                     text_feat = None
                 context = text_feat
-            # 涓嶅惈鏂囨湰淇℃伅鏃朵负鍏冪粍锛岋紙image, class_idx锛?
+            # 不含文本信息时为元组，（image, class_idx）
             else:
                 x, _ = batch
                 x = x.to(device)
                 context = None
 
-            # 浼樺寲杩囩▼
-            # 娓呯┖姊害
+            # 优化过程
+            # 清空梯度
             optimizer.zero_grad()
 
-            # 娣峰悎绮惧害浼樺寲
+            # 混合精度优化
             autocast_ctx = torch.autocast(device_type=device.type, enabled=args.amp and device.type == "cuda")
             with autocast_ctx:
                 # loss: mse + weight*kl
                 # status: string
                 loss, stats = diffusion_loss(unet, vae, schedule, x, context=context)
-            # scale/step/update鏄埗绫籺orch.amp.GradSclaler绫讳笅鐨勬柟娉曪紝.backward()涓簍orch.Tensor绫讳笅鐨勬柟娉?
+            # scale/step/update是父类torch.amp.GradSclaler类下的方法，.backward()为torch.Tensor类下的方法
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
 
-            # 璁粌杩涘害鎵撳嵃
+            # 训练进度打印
             if global_step % args.log_interval == 0:
                 print(f"step {global_step} | loss {loss.item():.4f} | mse {stats['mse']:.4f} | kl {stats['kl']:.4f}")
                 with log_path.open("a", encoding="utf-8") as f:
                     f.write(f"{global_step},train,{loss.item():.6f},{stats['mse']:.6f},{stats['kl']:.6f}\n")
-            # 瀹氭淇濆瓨ckpt
+            # 定步保存ckpt
             if global_step % args.ckpt_interval == 0 and global_step > 0:
                 save_ckpt(args, vae, unet, optimizer, global_step)
-            # 鑻ラ獙璇侀泦瀛樺湪鍒欏畾姝ユ鏌ユā鍨嬪湪楠岃瘉闆嗕笂鐨勮〃鐜?
+            # 若验证集存在则定步检查模型在验证集上的表现
             if val_loader is not None and global_step % args.val_interval == 0 and global_step > 0:
-                # 浠呰繑鍥?loss": total_loss / n,    "mse": total_mse / n,   "kl": total_kl / n
+                # 仅返回"loss": total_loss / n,    "mse": total_mse / n,   "kl": total_kl / n
                 val_stats = evaluate(unet, vae, schedule, val_loader, device, max_batches=args.val_max_batches,
                                      text_encoder=text_encoder, tokenizer=tokenizer, caption_drop=args.caption_drop if args.jsonl else 0.0)
                 if val_stats["loss"] is not None:
-                    #鎵撳嵃杩斿洖鍊?
+                    #打印返回值
                     print(f"[val] step {global_step} | loss {val_stats['loss']:.4f} | mse {val_stats['mse']:.4f} | kl {val_stats['kl']:.4f}")
                     with log_path.open("a", encoding="utf-8") as f:
                         f.write(f"{global_step},val,{val_stats['loss']:.6f},{val_stats['mse']:.6f},{val_stats['kl']:.6f}\n")
-                    # 瀵绘壘鏈€浼樺€硷紝鑻ユ洿灏忓垯淇濆瓨璇ユā鍨?                    if val_stats["loss"] < best_val:
+                    # 寻找最优值，若更小则保存该模型
+                    if val_stats["loss"] < best_val:
                         best_val = val_stats["loss"]
                         best_ckpt_path = save_ckpt(args, vae, unet, optimizer, global_step, final=False, best=True)
-                        # 璁板綍鈥滃綋鍓嶆渶浣抽獙璇佺粨鏋溾€濆埌鐙珛琛紝渚夸簬鍚庣画绛涢€?best step 涓?best ckpt
+                        # 记录“当前最佳验证结果”到独立表，便于后续筛选 best step 与 best ckpt
                         with best_log_path.open("a", encoding="utf-8") as f:
                             f.write(f"{global_step},{val_stats['loss']:.6f},{val_stats['mse']:.6f},{val_stats['kl']:.6f},{best_ckpt_path}\n")
-                        # 鏈€浣抽獙璇侀泦琛ㄧ幇鏇存柊浜庣鍑犳
+                        # 最佳验证集表现更新于第几步
                         print(f"[ckpt] best val updated at step {global_step}")
             global_step += 1
 
-            # 闃叉瓒婄晫
+            # 防止越界
             if global_step >= args.max_steps:
                 break
-        # 闃叉瓒婄晫
+        # 防止越界
         if global_step >= args.max_steps:
             break
 
@@ -287,6 +297,10 @@ def save_ckpt(args, vae, unet, optimizer, step, final=False, best=False):
         "unet": unet.state_dict(),
         "opt": optimizer.state_dict(),
         "step": step,
+        "meta": {
+            "vae_backend": args.vae_backend,
+            "vae_source": args.vae_source,
+        },
     }, path)
     print(f"[ckpt] saved to {path}")
     return path
@@ -294,30 +308,32 @@ def save_ckpt(args, vae, unet, optimizer, step, final=False, best=False):
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--data_root", type=str, default=None, help="ImageFolder root for unconditional training")
-    p.add_argument("--jsonl", type=str, default=None, help="jsonl annotation path for text-image training")
-    p.add_argument("--img_root", type=str, default=None, help="base image root used by jsonl image paths")
-    p.add_argument("--val_root", type=str, default=None, help="validation ImageFolder root")
-    p.add_argument("--val_jsonl", type=str, default=None, help="validation jsonl annotation path")
-    p.add_argument("--val_img_root", type=str, default=None, help="validation image root used by jsonl paths")
-    p.add_argument("--val_interval", type=int, default=1000, help="run validation every N steps")
-    p.add_argument("--val_max_batches", type=int, default=50, help="max validation batches per eval")
-    p.add_argument("--resolution", type=int, default=256)
-    p.add_argument("--batch_size", type=int, default=4)
-    p.add_argument("--num_workers", type=int, default=4)
-    p.add_argument("--epochs", type=int, default=100)
-    p.add_argument("--max_steps", type=int, default=10000)
-    p.add_argument("--num_steps", type=int, default=1000, help="diffusion timesteps T")
-    p.add_argument("--beta_start", type=float, default=1e-4)
-    p.add_argument("--beta_end", type=float, default=0.02)
-    p.add_argument("--lr", type=float, default=1e-4)
-    p.add_argument("--amp", action="store_true", help="enable AMP mixed precision")
-    p.add_argument("--out_dir", type=str, default="runs")
-    p.add_argument("--log_interval", type=int, default=50)
-    p.add_argument("--ckpt_interval", type=int, default=1000)
-    p.add_argument("--caption_drop", type=float, default=0.1, help="text dropout rate for classifier-free guidance")
-    p.add_argument("--vae_ckpt", type=str, default=None, help="external VAE state_dict path")
-    p.add_argument("--freeze_vae", action="store_true", help="freeze VAE and train UNet only")
+    p.add_argument("--data_root", type=str, default=None, help="无条件训练的 ImageFolder 根目录")
+    p.add_argument("--jsonl", type=str, default=None, help="文图训练使用的 jsonl 标注文件路径")
+    p.add_argument("--img_root", type=str, default=None, help="jsonl 中图片相对路径对应的根目录")
+    p.add_argument("--val_root", type=str, default=None, help="验证集 ImageFolder 根目录")
+    p.add_argument("--val_jsonl", type=str, default=None, help="验证集 jsonl 标注文件路径")
+    p.add_argument("--val_img_root", type=str, default=None, help="验证集 jsonl 图片根目录")
+    p.add_argument("--val_interval", type=int, default=1000, help="每 N 个 step 进行一次验证")
+    p.add_argument("--val_max_batches", type=int, default=50, help="每次验证最多评估的 batch 数")
+    p.add_argument("--resolution", type=int, default=256, help="训练输入分辨率")
+    p.add_argument("--batch_size", type=int, default=4, help="训练 batch 大小")
+    p.add_argument("--num_workers", type=int, default=4, help="DataLoader 进程数")
+    p.add_argument("--epochs", type=int, default=100, help="训练轮数上限")
+    p.add_argument("--max_steps", type=int, default=10000, help="训练总 step 上限")
+    p.add_argument("--num_steps", type=int, default=1000, help="扩散过程总时间步 T")
+    p.add_argument("--beta_start", type=float, default=1e-4, help="beta 调度起始值")
+    p.add_argument("--beta_end", type=float, default=0.02, help="beta 调度结束值")
+    p.add_argument("--lr", type=float, default=1e-4, help="优化器学习率")
+    p.add_argument("--amp", action="store_true", help="启用 AMP 混合精度")
+    p.add_argument("--out_dir", type=str, default="runs", help="训练输出目录（日志与 ckpt）")
+    p.add_argument("--log_interval", type=int, default=50, help="每 N 个 step 打印一次训练日志")
+    p.add_argument("--ckpt_interval", type=int, default=1000, help="每 N 个 step 保存一次常规 ckpt")
+    p.add_argument("--caption_drop", type=float, default=0.1, help="CFG 训练时文本条件随机丢弃概率")
+    p.add_argument("--vae_backend", type=str, default="toy", choices=["toy", "diffusers"], help="VAE 后端：toy 或 diffusers")
+    p.add_argument("--vae_source", type=str, default="stabilityai/sd-vae-ft-mse", help="diffusers VAE 来源（HF 模型名或本地目录）")
+    p.add_argument("--vae_ckpt", type=str, default=None, help="训练开始前加载的 VAE 权重文件（state_dict）")
+    p.add_argument("--freeze_vae", action="store_true", help="冻结 VAE，仅训练 UNet")
     return p.parse_args()
 
 

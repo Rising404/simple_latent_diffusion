@@ -2,3 +2,5 @@ torch
 torchvision
 open_clip_torch
 Pillow
+diffusers
+safetensors
