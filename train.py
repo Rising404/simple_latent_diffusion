@@ -149,14 +149,14 @@ def train(args):
 
     vae = AutoencoderKL().to(device)
     if args.vae_ckpt:
-        # 鍏佽鍔犺浇澶栭儴棰勮缁?VAE锛宻trict=False 浠ュ吋瀹归儴鍒嗛敭鍚嶄笉涓€鑷?
+        # 允许加载外部预训练 VAE，strict=False 以兼容部分键名不一致
         ckpt = torch.load(args.vae_ckpt, map_location=device)
         load_info = vae.load_state_dict(ckpt, strict=False)
         print(f"[vae] loaded from {args.vae_ckpt}, missing={load_info.missing_keys}, unexpected={load_info.unexpected_keys}")
         if args.freeze_vae:
             for p in vae.parameters():
                 p.requires_grad = False
-            print("[vae] parameters frozen (鍙缁?UNet)")
+            print("[vae] parameters frozen (只训练 UNet)")
 
     unet = ModernDiffusionUNet().to(device)
 
@@ -179,18 +179,19 @@ def train(args):
     # 娣峰悎绮惧害浼樺寲锛実radient scaling
     # 浼樺寲鎴恌loat16鑳藉噺灏戞樉瀛樺崰鐢ㄤ絾浼氬鑷寸簿搴︽崯澶憋紝闇€瑕乻cale閬垮厤鎹熷け锛岃瑙佺埗绫伙細
     # https://github.com/pytorch/pytorch/blob/v2.11.0/torch/amp/grad_scaler.py
-    # AMP锛氫粎鍦?CUDA 璁惧涓婂惎鐢紝閬垮厤 CPU 鐜鎶ラ敊
+    # AMP：仅在 CUDA 设备上启用，避免 CPU 环境报错
     scaler = torch.amp.GradScaler(
+        device="cuda" if device.type == "cuda" else "cpu",
         enabled=args.amp and device.type == "cuda",
-       device_type="cuda" if device.type == "cuda" else None,
     )
 
-    #鏂板缓杈撳嚭鐩綍锛岄€愯疆璁粌
+    #新建输出目录，逐轮训练
     os.makedirs(args.out_dir, exist_ok=True)
     log_path = Path(args.out_dir) / "train_log.csv"
     if not log_path.exists():
         log_path.write_text("step,split,loss,mse,kl\n", encoding="utf-8")
-    # 鏈€浣抽獙璇佺粨鏋滃崟鐙褰曪紝閬垮厤涓庡父瑙勯棿闅旀棩蹇楁贩鍦ㄤ竴璧?    best_log_path = Path(args.out_dir) / "best_val_log.csv"
+    # 最佳验证结果单独记录，避免与常规间隔日志混在一起
+    best_log_path = Path(args.out_dir) / "best_val_log.csv"
     if not best_log_path.exists():
         best_log_path.write_text("step,loss,mse,kl,ckpt\n", encoding="utf-8")
 
@@ -277,8 +278,10 @@ def train(args):
 
 
 def save_ckpt(args, vae, unet, optimizer, step, final=False, best=False):
-    # 鏍规嵁杞暟鍐冲畾鏂囦欢鍚?    tag = "final" if final else (f"best_step{step}" if best else f"step{step}")
-    # 淇濆瓨璺緞/鏂囦欢鍚?    path = Path(args.out_dir) / f"ckpt_{tag}.pt"
+    # 根据轮数决定文件名
+    tag = "final" if final else (f"best_step{step}" if best else f"step{step}")
+    # 保存路径/文件名
+    path = Path(args.out_dir) / f"ckpt_{tag}.pt"
     torch.save({
         "vae": vae.state_dict(),
         "unet": unet.state_dict(),
